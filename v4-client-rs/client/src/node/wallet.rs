@@ -73,18 +73,19 @@ impl Wallet {
                 next_nonce: None,
             },
             account_id,
-            index,
+            index: Some(index),
             key: private_key,
             auths: AuthenticatorsManager::default(),
         })
     }
 }
 
-/// Represents a derived account.
-///
-/// See also [`Wallet`].
+/// Represents an account, either derived from a [`Wallet`] or built directly
+/// from a private key.
 pub struct Account {
-    index: u32,
+    /// `None` when the account was created from a private key directly: there
+    /// is no derivation path, so any index would be a fabrication.
+    index: Option<u32>,
     // The `String` representation of the `AccountId`
     key: SigningKey,
     // The `String` representation of the `AccountId`
@@ -115,9 +116,48 @@ pub struct AuthenticatorsManager {
 }
 
 impl Account {
-    /// An index of the derived account.
-    pub fn index(&self) -> &u32 {
-        &self.index
+    /// Build an account directly from a secp256k1 private key.
+    ///
+    /// [`Wallet`] derives accounts from a BIP-39 mnemonic, which is the only
+    /// route this client otherwise offers. That forces any integration whose
+    /// key material is provisioned out of band — an HSM export, a per-service
+    /// key, a key held in a secret manager — to invent a mnemonic it does not
+    /// have and does not want.
+    ///
+    /// The key IS the account here: there is no seed and no derivation path, so
+    /// [`Account::index`] is `None`. The resulting address is the standard
+    /// bech32 `dydx1…` address for this key, identical to what any Cosmos
+    /// tooling computes — which is what makes funds recoverable by importing
+    /// the key elsewhere.
+    ///
+    /// `account_number` and `sequence_number` are zeroed, exactly as
+    /// [`Wallet::account_offline`] leaves them; use
+    /// [`NodeClient::query_address`] to populate them before signing.
+    pub fn from_private_key(key: impl AsRef<[u8]>) -> Result<Self, Error> {
+        let key = SigningKey::from_slice(key.as_ref()).map_err(Error::msg)?;
+        let account_id = key
+            .public_key()
+            .account_id(BECH32_PREFIX_DYDX)
+            .map_err(Error::msg)?;
+        let address = account_id.to_string().parse()?;
+        Ok(Self {
+            public: PublicAccount {
+                address,
+                account_number: 0,
+                sequence_number: 0,
+                next_nonce: None,
+            },
+            account_id,
+            index: None,
+            key,
+            auths: AuthenticatorsManager::default(),
+        })
+    }
+
+    /// The BIP-44 index this account was derived at, or `None` when it was
+    /// built from a private key via [`Account::from_private_key`].
+    pub fn index(&self) -> Option<u32> {
+        self.index
     }
 
     /// A public key associated with the account.
@@ -149,6 +189,8 @@ impl Account {
             pub fn subaccount(&self, number: u32) -> Result<Subaccount, Error>;
             /// The account number.
             pub fn account_number(&self) -> u64;
+            /// Set a new account number.
+            pub fn set_account_number(&mut self, account_number: u64);
             /// The account sequence number.
             pub fn sequence_number(&self) -> u64;
             /// Set a new sequence number.
@@ -204,6 +246,16 @@ impl PublicAccount {
     /// The account sequence number.
     pub fn sequence_number(&self) -> u64 {
         self.sequence_number
+    }
+
+    /// Set a new account number.
+    ///
+    /// The counterpart to [`PublicAccount::set_sequence_number`]. Both are
+    /// needed to bring an offline-built account — from
+    /// [`Wallet::account_offline`] or [`Account::from_private_key`] — up to
+    /// date via [`NodeClient::query_address`] before signing.
+    pub fn set_account_number(&mut self, account_number: u64) {
+        self.account_number = account_number;
     }
 
     /// Set a new sequence number.
@@ -299,5 +351,69 @@ mod noble {
         pub fn account_offline(&self, index: u32) -> Result<Account, Error> {
             self.wallet.derive_account(index, BECH32_PREFIX_NOBLE)
         }
+    }
+}
+
+#[cfg(test)]
+mod private_key_tests {
+    use super::*;
+    use bip32::XPrv;
+
+    /// The canonical BIP-39 test vector for 32 bytes of zero entropy.
+    /// 24 words, because that is all this client's `Mnemonic` accepts.
+    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                                 abandon abandon abandon abandon abandon abandon abandon abandon \
+                                 abandon abandon abandon abandon abandon abandon abandon art";
+
+    /// A key-built account must land on the SAME address as the mnemonic path
+    /// for the same underlying key.
+    ///
+    /// This is the property that makes the constructor safe to fund: if the two
+    /// routes disagreed, money sent to a key-built address would be unreachable
+    /// by anyone importing the mnemonic, and vice versa.
+    #[test]
+    fn from_private_key_matches_the_mnemonic_derivation() {
+        let derived = Wallet::from_mnemonic(TEST_MNEMONIC)
+            .expect("valid mnemonic")
+            .account_offline(0)
+            .expect("derives");
+
+        // Independently recover the raw key at the same path, then build an
+        // account from the bytes alone.
+        let seed = Mnemonic::new(TEST_MNEMONIC, Language::English)
+            .expect("valid mnemonic")
+            .to_seed("");
+        let path: DerivationPath = "m/44'/118'/0'/0/0".parse().expect("valid path");
+        let xprv = XPrv::derive_from_path(&seed, &path).expect("derives");
+        let from_key = Account::from_private_key(xprv.to_bytes()).expect("builds");
+
+        assert_eq!(
+            derived.address(),
+            from_key.address(),
+            "key-built address must equal the mnemonic-derived one"
+        );
+        // The index is the one thing that legitimately differs: a raw key has
+        // no derivation path, so claiming index 0 would be a fabrication.
+        assert_eq!(derived.index(), Some(0));
+        assert_eq!(from_key.index(), None);
+
+        // Pinned against an EXTERNAL vector, not our own arithmetic. This
+        // mnemonic at m/44'/118'/0'/0/0 is published across the Cosmos
+        // ecosystem as `cosmos1r5v5srda7xfth3hn2s26txvrcrntldjumt8mhl`; the
+        // 20-byte payload below is that address re-encoded under the `dydx`
+        // HRP (same payload, different bech32 checksum). If this line ever
+        // fails, the address derivation has drifted and funds would be sent
+        // somewhere the key cannot reach.
+        assert_eq!(
+            from_key.address().to_string(),
+            "dydx1r5v5srda7xfth3hn2s26txvrcrntldjujjflhg"
+        );
+    }
+
+    #[test]
+    fn from_private_key_rejects_malformed_keys() {
+        assert!(Account::from_private_key([]).is_err(), "empty");
+        assert!(Account::from_private_key([0u8; 31]).is_err(), "too short");
+        assert!(Account::from_private_key([0u8; 32]).is_err(), "zero key");
     }
 }
